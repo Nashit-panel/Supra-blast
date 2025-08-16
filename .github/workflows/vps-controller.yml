@@ -1,0 +1,208 @@
+# .github/workflows/vps-controller.yml
+# ------------------------------------------------------------
+# ⚠️ NOTE (read the comments):
+# - This runs on GitHub Actions (ubuntu-22.04 runner).
+# - GitHub-hosted runners are EPHEMERAL and have a hard max runtime per job
+#   (typically up to 6 hours). This cannot run truly 24/7 on GitHub’s infra.
+# - This workflow bootstraps a "controller" stack you can later connect to:
+#     • website.js  -> your control panel (Node.js/Express or similar)
+#     • Web terminal -> Wetty (browser-based terminal)
+#     • File manager -> FileBrowser
+#     • Optional public URLs -> Cloudflared ephemeral tunnels (no token required)
+# - You’ll add your own `website.js` and package.json later. For now,
+#   this workflow just prepares the environment and shows the URLs.
+# ------------------------------------------------------------
+
+name: VPS Controller (Ubuntu 22.04)
+
+on:
+  workflow_dispatch:
+    inputs:
+      NODE_VERSION:
+        description: "Node.js version"
+        default: "20"
+        required: true
+      PANEL_PORT:
+        description: "Port for website.js control panel"
+        default: "3000"
+        required: true
+      TERMINAL_PORT:
+        description: "Port for web terminal (Wetty)"
+        default: "7681"
+        required: true
+      FILES_PORT:
+        description: "Port for FileBrowser"
+        default: "8080"
+        required: true
+  # You can also keep this workflow waiting for manual re-runs or repository_dispatch
+  repository_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vps-controller-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  start:
+    name: Boot Controller Stack
+    runs-on: ubuntu-22.04   # Explicit Ubuntu 22 runner
+    timeout-minutes: 360     # Max allowed on GitHub-hosted runners
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Print runner info
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "User  : $(whoami)"
+          echo "UID   : $(id -u)"
+          echo "Sudo? : checking…"
+          sudo -n true && echo "sudo works without password" || echo "sudo requires password (still available)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.NODE_VERSION }}
+
+      - name: Install base packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            curl wget git unzip jq tmux openssh-client \
+            build-essential python3 python3-pip
+
+      - name: Install PM2 (process manager)
+        run: |
+          npm i -g pm2
+
+      # --- Optional: create a minimal website.js if missing (you will replace this later) ---
+      - name: Create minimal website.js placeholder (if not present)
+        run: |
+          if [ ! -f website.js ]; then
+            cat > website.js <<'EOF'
+            const http = require('http');
+            const port = process.env.PANEL_PORT || ${PANEL_PORT:-3000};
+            const server = http.createServer((req, res) => {
+              res.writeHead(200, { 'Content-Type': 'text/plain' });
+              res.end('VPS Controller placeholder is running. Replace website.js with your real UI.\n');
+            });
+            server.listen(port, () => console.log('website.js listening on port', port));
+            EOF
+          fi
+
+      - name: Create minimal package.json (if not present)
+        run: |
+          if [ ! -f package.json ]; then
+            cat > package.json <<'EOF'
+            {
+              "name": "vps-controller",
+              "private": true,
+              "version": "0.0.1",
+              "main": "website.js",
+              "scripts": {
+                "start": "node website.js"
+              },
+              "dependencies": {}
+            }
+            EOF
+          fi
+
+      - name: Install app dependencies (if any)
+        run: |
+          if [ -f package-lock.json ] || [ -f package.json ]; then
+            npm ci || npm i
+          fi
+
+      # --- Web terminal via Wetty ---
+      - name: Install Wetty (web terminal)
+        run: |
+          npm i -g wetty@2
+          # Create a login shell for wetty; GitHub runner user is 'runner'
+          echo 'export TERM=xterm-256color' >> $HOME/.bashrc
+
+      # --- File manager via FileBrowser ---
+      - name: Install FileBrowser
+        run: |
+          FB_VER="$(curl -sL https://api.github.com/repos/filebrowser/filebrowser/releases/latest | jq -r '.tag_name')"
+          curl -L "https://github.com/filebrowser/filebrowser/releases/download/${FB_VER}/linux-amd64-filebrowser.tar.gz" -o fb.tgz
+          sudo tar -xzf fb.tgz -C /usr/local/bin filebrowser
+          sudo chmod +x /usr/local/bin/filebrowser
+          rm -f fb.tgz
+          # Initial DB in workspace so it persists within this job
+          mkdir -p $GITHUB_WORKSPACE/.fbdata
+
+      # --- Optional: code-server (web VS Code) ---
+      - name: Install code-server (optional IDE)
+        run: |
+          curl -fsSL https://code-server.dev/install.sh | sh
+          # Will run on port 8443 by default with password in ~/.config/code-server/config.yaml
+
+      # --- Cloudflared for public URLs (ephemeral tunnels; no token required) ---
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb || sudo apt-get -f install -y
+          rm -f cloudflared.deb
+
+      # --- Start all services under PM2 ---
+      - name: Start services with PM2
+        env:
+          PANEL_PORT: ${{ inputs.PANEL_PORT }}
+          TERMINAL_PORT: ${{ inputs.TERMINAL_PORT }}
+          FILES_PORT: ${{ inputs.FILES_PORT }}
+        run: |
+          pm2 start "node website.js" --name panel --env PANEL_PORT=$PANEL_PORT
+          pm2 start "wetty -p $TERMINAL_PORT --base /terminal --title 'VPS Controller Terminal' --force-ssh false" --name terminal
+          pm2 start "filebrowser -a 127.0.0.1 -p $FILES_PORT -r $GITHUB_WORKSPACE -d $GITHUB_WORKSPACE/.fbdata/filebrowser.db" --name files
+          pm2 start "code-server --host 127.0.0.1 --port 8443 --disable-telemetry" --name ide
+          pm2 save
+          pm2 list
+
+      - name: Open ephemeral public URLs with cloudflared
+        env:
+          PANEL_PORT: ${{ inputs.PANEL_PORT }}
+          TERMINAL_PORT: ${{ inputs.TERMINAL_PORT }}
+          FILES_PORT: ${{ inputs.FILES_PORT }}
+        run: |
+          # Each command prints a unique https://trycloudflare.com URL to the logs.
+          nohup cloudflared tunnel --url http://localhost:$PANEL_PORT > panel.url.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:${TERMINAL_PORT} > terminal.url.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:${FILES_PORT} > files.url.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:8443 > ide.url.log 2>&1 &
+          sleep 2
+          echo "==== Public URLs (look for 'trycloudflare.com') ===="
+          grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' *.url.log || true
+          echo "===================================================="
+
+      # --- Show service health & access info in logs ---
+      - name: Show status and tips
+        env:
+          PANEL_PORT: ${{ inputs.PANEL_PORT }}
+          TERMINAL_PORT: ${{ inputs.TERMINAL_PORT }}
+          FILES_PORT: ${{ inputs.FILES_PORT }}
+        run: |
+          echo
+          echo "Local endpoints on the runner:"
+          echo "  Panel       : http://127.0.0.1:${PANEL_PORT}"
+          echo "  Terminal    : http://127.0.0.1:${TERMINAL_PORT}  (Wetty)"
+          echo "  FileBrowser : http://127.0.0.1:${FILES_PORT}"
+          echo "  IDE         : http://127.0.0.1:8443             (code-server)"
+          echo
+          echo "Public URLs (if cloudflared succeeded) were printed above."
+          echo
+          echo "IMPORTANT: This job will auto-stop when the GitHub Actions time limit is reached."
+          echo "Re-run the workflow to start a fresh session."
+
+      # --- Keep the job alive as long as possible (until timeout) ---
+      - name: Keep alive until timeout or manual cancel
+        run: |
+          echo "Controller stack running. This loop holds the job until it times out."
+          echo "Press 'Cancel workflow' in the Actions UI to stop early."
+          # Sleep ~6 hours (max timeout-minutes controls the upper limit)
+          for i in $(seq 1 21600); do
+            printf "."; sleep 1
+          done
+          
